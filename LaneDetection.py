@@ -3,116 +3,178 @@ import numpy as np
 
 def region_of_interest(img, vertices):
     """
-    Áp dụng mặt nạ cho ảnh, chỉ giữ lại vùng xác định bởi vertices.
+    Apply the ROI mask to the image.
     """
     mask = np.zeros_like(img)
     cv2.fillPoly(mask, vertices, 255)
     masked_img = cv2.bitwise_and(img, mask)
     return masked_img
 
-def make_line_points(frame, line):
+def average_slope_intercept(lines):
     """
-    Nội suy các điểm của đường thẳng từ hệ số góc (slope) và hệ số chặn (intercept).
-    Trả về điểm đầu và điểm cuối của đường thẳng để vẽ.
-    """
-    slope, intercept = line
-    y1 = frame.shape[0]       # đáy ảnh
-    y2 = int(y1 * 0.6)          # một phần phía trên đáy ảnh (điểm cuối của đường)
-    # Tính điểm x từ phương trình đường thẳng: x = (y - intercept) / slope
-    x1 = int((y1 - intercept) / slope)
-    x2 = int((y2 - intercept) / slope)
-    return [x1, y1, x2, y2]
-
-def compute_average_lines(frame, lines):
-    """
-    Phân tách các đường thành nhóm bên trái và bên phải dựa trên độ dốc.
-    Tính trung bình các đường trong mỗi nhóm để có được đường ước tính cho làn trái và làn phải.
+    Separate lines by slope (left and right) and compute the average slope and intercept.
+    Returns two tuples (slope, intercept) for the left and right lane lines.
     """
     left_lines = []
     right_lines = []
-    if lines is None:
-        return None, None
     for line in lines:
         for x1, y1, x2, y2 in line:
-            if x2 - x1 == 0:
-                continue  # tránh chia cho 0
+            if x2 - x1 == 0:  # avoid division by zero
+                continue
             slope = (y2 - y1) / (x2 - x1)
             intercept = y1 - slope * x1
-            # Đường bên trái có độ dốc âm, bên phải có độ dốc dương (có thể điều chỉnh ngưỡng tùy thuộc vào video)\n
-            if slope < -0.5:
-                left_lines.append((slope, intercept))
-            elif slope > 0.5:
-                right_lines.append((slope, intercept))
-    left_line = None
-    right_line = None
-    if left_lines:
-        left_avg = np.mean(left_lines, axis=0)
-        left_line = make_line_points(frame, left_avg)
-    if right_lines:
-        right_avg = np.mean(right_lines, axis=0)
-        right_line = make_line_points(frame, right_avg)
-    return left_line, right_line
+            length = np.sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2)
+            # Assume the left lane has a negative slope, and the right lane has a positive slope
+            if slope < 0:
+                left_lines.append((slope, intercept, length))
+            else:
+                right_lines.append((slope, intercept, length))
+    
+    left_lane = None
+    right_lane = None
+    if len(left_lines) > 0:
+        left_lane = np.average(np.array(left_lines), axis=0, weights=[line[2] for line in left_lines])
+    if len(right_lines) > 0:
+        right_lane = np.average(np.array(right_lines), axis=0, weights=[line[2] for line in right_lines])
+    
+    return left_lane, right_lane
 
-def process_video(video_path):
-    cap = cv2.VideoCapture(video_path)
+def make_line_points(y1, y2, line):
+    """
+    Based on the (slope, intercept) of the line, calculate the starting and ending points from y1 to y2.
+    Returns None if the slope is zero (or nearly zero) to avoid division by zero.
+    """
+    if line is None:
+        return None
+    slope, intercept = line[0], line[1]
+    # Check if slope is nearly zero to avoid division by zero
+    if abs(slope) < 1e-6:
+        return None
+    x1 = int((y1 - intercept) / slope)
+    x2 = int((y2 - intercept) / slope)
+    return (x1, int(y1)), (x2, int(y2))
+
+def draw_polygon(img, left_line, right_line):
+    """
+    Draw a polygon connecting the two lane lines, representing the vehicle's path.
+    """
+    height = img.shape[0]
+    y_bottom = height
+    y_top = int(height * 0.6)
+    left_points = make_line_points(y_bottom, y_top, left_line)
+    right_points = make_line_points(y_bottom, y_top, right_line)
+    if left_points is None or right_points is None:
+        return img
+    # Polygon points: bottom left, bottom right, top right, top left
+    polygon_points = np.array([left_points[0], right_points[0], right_points[1], left_points[1]])
+    cv2.fillPoly(img, [polygon_points], (0, 255, 0))
+    return img
+
+def process_frame(frame):
+    # Convert the frame to grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Apply Gaussian blur to reduce noise
+    gaussian = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Perform Canny edge detection
+    canny = cv2.Canny(gaussian, 50, 150)
+    
+    # Define the dimensions of the image and the ROI (assume the lower part of the image)
+    height, width = canny.shape
+    roi_vertices = np.array([[
+        (0, height),
+        (width, height),
+        (int(width * 0.55), int(height * 0.6)),
+        (int(width * 0.45), int(height * 0.6))
+    ]], dtype=np.int32)
+    roi = region_of_interest(canny, roi_vertices)
+    
+    # Use Hough Line Transform to detect lines
+    lines = cv2.HoughLinesP(roi, 1, np.pi/180, threshold=50, minLineLength=50, maxLineGap=150)
+    
+    left_lane, right_lane = None, None
+    if lines is not None:
+        left_lane, right_lane = average_slope_intercept(lines)
+    
+    # Calculate line points from y = height to y = 0.6 * height
+    left_line_points = make_line_points(height, int(height * 0.6), left_lane)
+    right_line_points = make_line_points(height, int(height * 0.6), right_lane)
+    
+    # Create a copy of the original frame to draw the results
+    final_result = frame.copy()
+    
+    # Draw the detected lane lines (blue color)
+    if left_line_points is not None:
+        cv2.line(final_result, left_line_points[0], left_line_points[1], (255, 0, 0), 10)
+    if right_line_points is not None:
+        cv2.line(final_result, right_line_points[0], right_line_points[1], (255, 0, 0), 10)
+    
+    # Draw the polygon representing the vehicle's path (green color)
+    final_result = draw_polygon(final_result, left_lane, right_lane)
+    
+    return gaussian, canny, roi, final_result
+
+def main():
+    # Use video from a file or camera (change "test_video.mp4" to your video path,
+    # or use cv2.VideoCapture(0) to use the webcam)
+    cap = cv2.VideoCapture("Driving_Vid2.mp4")
+    
     if not cap.isOpened():
-        print("Không thể mở video:", video_path)
+        print("Unable to open video. Please check the video path or camera connection.")
         return
 
-    while cap.isOpened():
+    while True:
         ret, frame = cap.read()
         if not ret:
+            print("End of video or unable to read frame.")
             break
+        
+        # Process each frame
+        gaussian, canny, roi, final_result = process_frame(frame)
+        
+        # Resize window
+        # gaussian = cv2.resize(gaussian, (0, 0), None, .25, .25)
+        # canny = cv2.resize(canny, (0, 0), None, .25, .25)
+        # roi = cv2.resize(roi, (0, 0), None, .25, .25)
+        # final_result = cv2.resize(final_result, (0, 0), None, .25, .25)
 
-        # Tiền xử lý: chuyển sang grayscale, làm mờ Gaussian và phát hiện cạnh bằng Canny
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, 50, 150)
+        # Display the results in 4 separate windows
+        # cv2.imshow("Gaussian Blur", gaussian_rz)
+        # cv2.imshow("Canny Edges", canny_rz)
+        # cv2.imshow("Region of Interest (ROI)", roi_rz)
+        # cv2.imshow("Final Result", final_result_rz)
 
-        # Xác định vùng quan tâm (ROI) - giả sử là vùng hình tứ giác chứa làn xe
-        height, width = frame.shape[:2]
-        roi_vertices = np.array([[
-            (0, height),
-            (width, height),
-            (int(width * 0.55), int(height * 0.6)),
-            (int(width * 0.45), int(height * 0.6))
-        ]], np.int32)
-        masked_edges = region_of_interest(edges, roi_vertices)
+        # Resize images
+        gaussian = cv2.resize(gaussian, (0, 0), fx=0.25, fy=0.25)
+        canny = cv2.resize(canny, (0, 0), fx=0.25, fy=0.25)
+        roi = cv2.resize(roi, (0, 0), fx=0.25, fy=0.25)
+        final_result = cv2.resize(final_result, (0, 0), fx=0.25, fy=0.25)
 
-        # Dùng Hough Transform để phát hiện các đường thẳng
-        lines = cv2.HoughLinesP(masked_edges, 1, np.pi/180, threshold=50, minLineLength=40, maxLineGap=100)
+        # Check and revert grayscale to BGR if needed
+        if len(gaussian.shape) == 2:
+            gaussian = cv2.cvtColor(gaussian, cv2.COLOR_GRAY2BGR)
+        if len(canny.shape) == 2:
+            canny = cv2.cvtColor(canny, cv2.COLOR_GRAY2BGR)
+        if len(roi.shape) == 2:
+            roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
+        if len(final_result.shape) == 2:
+            final_result = cv2.cvtColor(final_result, cv2.COLOR_GRAY2BGR)
 
-        # Tính toán trung bình và nội suy cho các đường làn trái và phải
-        left_line, right_line = compute_average_lines(frame, lines)
+        # combine window
+        top_row = np.hstack((gaussian, canny))
+        bottom_row = np.hstack((roi, final_result))
+        combined = np.vstack((top_row, bottom_row))
 
-        # Nếu cả hai đường làn đều được xác định, tạo đa giác bao quanh làn xe
-        if left_line is not None and right_line is not None:
-            # Các điểm của đa giác: điểm dưới bên trái, trên bên trái, trên bên phải, dưới bên phải
-            polygon_points = np.array([
-                [left_line[0], left_line[1]],   # đáy trái
-                [left_line[2], left_line[3]],   # trên trái
-                [right_line[2], right_line[3]], # trên phải
-                [right_line[0], right_line[1]]  # đáy phải
-            ], np.int32)
-            polygon_points = polygon_points.reshape((-1, 1, 2))
-            
-            # Tạo overlay để vẽ đa giác với độ trong suốt (alpha)
-            overlay = frame.copy()
-            cv2.fillPoly(overlay, [polygon_points], (0, 255, 0))
-            alpha = 0.3  # độ trong suốt của overlay
-            frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-            
-            # Vẽ thêm các đường viền của làn xe (tùy chọn) để dễ nhận biết\n
-            cv2.line(frame, (left_line[0], left_line[1]), (left_line[2], left_line[3]), (255, 0, 0), 10)
-            cv2.line(frame, (right_line[0], right_line[1]), (right_line[2], right_line[3]), (255, 0, 0), 10)
+        # Show the result
+        cv2.imshow("Combined Results", combined)
 
-        cv2.imshow("Lane Detection", frame)
+        # Press 'q' to exit
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    video_path = "Driving_Vid2.mp4"  # Đổi tên hoặc đường dẫn video của bạn ở đây
-    process_video(video_path)
+if __name__ == '__main__':
+    main()
